@@ -302,7 +302,7 @@ class Transform {
     }
 
     get cameraPixelsPerMeter(): number {
-        return this.projection.pixelsPerMeter(this.center.lat, this.cameraWorldSize);
+        return mercatorZfromAltitude(this.center.lat, this.cameraWorldSize);
     }
 
     get centerOffset(): Point {
@@ -925,65 +925,6 @@ class Transform {
                 }
                 stack.push(child);
             }
-        }
-
-        if (this.fogCullDistSq) {
-            const fogCullDistSq = this.fogCullDistSq;
-            const horizonLineFromTop = this.horizonLineFromTop();
-            result = result.filter(entry => {
-                const min = [0, 0, 0, 1];
-                const max = [EXTENT, EXTENT, 0, 1];
-
-                const fogTileMatrix = this.calculateFogTileMatrix(entry.tileID.toUnwrapped());
-
-                vec4.transformMat4(min, min, fogTileMatrix);
-                vec4.transformMat4(max, max, fogTileMatrix);
-
-                const sqDist = getAABBPointSquareDist(min, max);
-
-                if (sqDist === 0) { return true; }
-
-                let overHorizonLine = false;
-
-                // Terrain loads at one zoom level lower than the raster data,
-                // so the following checks whether the terrain sits above the horizon and ensures that
-                // when mountains stick out above the fog (due to horizon-blend),
-                // we haven’t accidentally culled some of the raster tiles we need to draw on them.
-                // If we don’t do this, the terrain is default black color and may flash in and out as we move toward it.
-
-                const elevation = this._elevation;
-
-                if (elevation && sqDist > fogCullDistSq && horizonLineFromTop !== 0) {
-                    const projMatrix = this.calculateProjMatrix(entry.tileID.toUnwrapped());
-
-                    let minmax;
-                    if (!options.isTerrainDEM) {
-                        minmax = elevation.getMinMaxForTile(entry.tileID);
-                    }
-
-                    if (!minmax) { minmax = {min: minRange, max: maxRange}; }
-
-                    // ensure that we want `this.rotation` instead of `this.bearing` here
-                    const cornerFar = furthestTileCorner(this.rotation);
-
-                    const farX = cornerFar[0] * EXTENT;
-                    const farY = cornerFar[1] * EXTENT;
-
-                    const worldFar = [farX, farY, minmax.max];
-
-                    // World to NDC
-                    vec3.transformMat4(worldFar, worldFar, projMatrix);
-
-                    // NDC to Screen
-                    const screenCoordY = (1 - worldFar[1]) * this.height * 0.5;
-
-                    // Prevent cutting tiles crossing over the horizon line to
-                    // prevent pop-in and out within the fog culling range
-                    overHorizonLine = screenCoordY < horizonLineFromTop;
-                }
-
-                return sqDist < fogCullDistSq || overHorizonLine;
-            });
         }
 
         const cover = result.sort((a, b) => a.distanceSq - b.distanceSq).map(a => a.tileID);
@@ -1753,10 +1694,6 @@ class Transform {
     _calcFogMatrices() {
         this._fogTileMatrixCache = {};
 
-        const cameraWorldSize = this.cameraWorldSize;
-        const cameraPixelsPerMeter = this.cameraPixelsPerMeter;
-        const cameraPos = this._camera.position;
-
         // The mercator fog matrix encodes transformation necessary to transform a position to camera fog space (in meters):
         // translates p to camera origin and transforms it from pixels to meters. The windowScaleFactor is used to have a
         // consistent transformation across different window sizes.
@@ -1764,19 +1701,11 @@ class Transform {
         // - p.xy = p.xy * cameraWorldSize * windowScaleFactor
         // - p.z  = p.z  * cameraPixelsPerMeter * windowScaleFactor
         const windowScaleFactor = 1 / this.height;
-        const metersToPixel = [cameraWorldSize, cameraWorldSize, cameraPixelsPerMeter];
-        vec3.scale(metersToPixel, metersToPixel, windowScaleFactor);
-        vec3.scale(cameraPos, cameraPos, -1);
-        vec3.multiply(cameraPos, cameraPos, metersToPixel);
 
-        const m = mat4.create();
-        mat4.translate(m, m, cameraPos);
-        mat4.scale(m, m, metersToPixel);
-        this.mercatorFogMatrix = m;
-
+        this.mercatorFogMatrix = mat4.create();
         // The worldToFogMatrix can be used for conversion from world coordinates to relative camera position in
         // units of fractions of the map height. Later composed with tile position to construct the fog tile matrix.
-        this.worldToFogMatrix = this._camera.getWorldToCameraPosition(cameraWorldSize, cameraPixelsPerMeter, windowScaleFactor);
+        this.worldToFogMatrix = this._camera.getWorldToCameraPosition(this.worldSize, windowScaleFactor / this._projectionScaler);
     }
 
     _computeCameraPosition(targetPixelsPerMeter: ?number): Vec3 {
@@ -1881,7 +1810,6 @@ class Transform {
     _zoomFromMercatorZ(z: number): number {
         return this.scaleZoom(this.cameraToCenterDistance / (z * this.tileSize));
     }
-
     _terrainEnabled(): boolean {
         if (!this._elevation) return false;
         if (!this.projection.supportsTerrain) {
